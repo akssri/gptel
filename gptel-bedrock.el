@@ -144,15 +144,49 @@ Mutate state INFO with response metadata."
                               :id (plist-get tool-use :toolUseId))))
                          tool-use-blocks)))))
 
-(cl-defmethod gptel--parse-list ((_backend gptel-bedrock) prompt-strings)
-  "Create a list of prompt objects from PROMPT-STRINGS.
+(cl-defmethod gptel--parse-list ((backend gptel-bedrock) prompt-list)
+  "Create a list of prompt objects from PROMPT-LIST.
 
 Assumes this is a conversation with alternating roles."
-  (cl-loop for text in prompt-strings
-           for role = t then (not role)
-           if text collect
-           (list :role (if role "user" "assistant")
-                 :content `[(:text ,text)])))
+  (let ((full-prompt
+         (if (consp (car prompt-list))
+             (let ((prompts))
+               (dolist (entry prompt-list) ; Advanced format, list of lists
+                 (pcase entry
+                   (`(prompt . ,msg)
+                    (when-let ((text (or (car-safe msg) msg)))
+                      (push (list :role "user"
+                                  :content `[(:text ,text)])
+                            prompts)))
+                   (`(response . ,msg)
+                    (when-let ((text (or (car-safe msg) msg)))
+                      (push (list :role "assistant"
+                                  :content `[(:text ,text)])
+                            prompts)))
+                   (`(tool . ,call)
+                    (let ((id (or (plist-get call :id)
+                                  (substring (md5 (format "%s%s" (random) (float-time))) nil 24))))
+                      (push (list :role "assistant"
+                                  :content `[(:toolUse (:toolUseId ,id
+                                                        :name ,(plist-get call :name)
+                                                        :input ,(plist-get call :args)))])
+                            prompts)
+                      (push (gptel--parse-tool-results backend (list (cdr entry))) prompts)))))
+               (nreverse prompts))
+           (cl-loop for text in prompt-list ; Simple format, list of strings
+                    for role = t then (not role)
+                    if text
+                    collect (list :role (if role "user" "assistant")
+                                  :content `[(:text ,text)])))))
+    ;; Merge consecutive messages
+    (let ((merged nil))
+      (dolist (p full-prompt)
+        (if (and merged (equal (plist-get (car merged) :role) (plist-get p :role)))
+            (let* ((last (car merged))
+                   (new-content (vconcat (plist-get last :content) (plist-get p :content))))
+              (setcar merged (plist-put last :content new-content)))
+          (push p merged)))
+      (nreverse merged))))
 
 (cl-defmethod gptel--inject-media ((_backend gptel-bedrock) prompts)
   "Wrap the first user prompt in PROMPTS with included media files.
@@ -388,35 +422,70 @@ received."
           (_ (error "Unexpected event-type %S" event-type)))))
     (list :role role :content (vconcat (nreverse contents)))))
 
-(cl-defmethod gptel--parse-buffer ((_backend gptel-bedrock) &optional max-entries)
+(cl-defmethod gptel--parse-buffer ((backend gptel-bedrock) &optional max-entries)
   "Parse current buffer and return a list of prompt objects for Bedrock.
 
 MAX-ENTRIES is the maximum number of prompts to include."
   (unless max-entries (setq max-entries most-positive-fixnum))
   (let ((prompts nil) (prev-pt (point))
         (include-media (and gptel-track-media (gptel--model-capable-p 'media))))
-    (cl-flet ((capture-prompt (role beg end)
-                (let* ((content (if include-media
-                                 (gptel-bedrock--parse-multipart
-                                  (gptel--parse-media-links major-mode beg end))
-                                 `[(:text ,(gptel--trim-prefixes
-                                           (buffer-substring-no-properties beg end)))]))
-                       (prompt (list :role role :content content)))
-                  (push prompt prompts))))
-
-      (if (or gptel-mode gptel-track-response)
-          (while (and (> max-entries 0)
-                      (/= prev-pt (point-min))
-                      (goto-char (previous-single-property-change
-                                  (point) 'gptel nil (point-min))))
-            (capture-prompt (pcase (get-char-property (point) 'gptel)
-                              ('response "assistant")
-                              ('nil "user"))
-                            (point) prev-pt)
-            (setq prev-pt (point))
-            (cl-decf max-entries))
-        (capture-prompt "user" (point-min) (point-max)))
-      prompts)))
+    (if (or gptel-mode gptel-track-response)
+        (while (and (or (not max-entries) (>= max-entries 0))
+                    (/= prev-pt (point-min))
+                    (goto-char (previous-single-property-change
+                                (point) 'gptel nil (point-min))))
+          (pcase (get-char-property (point) 'gptel)
+            ('response
+             (when-let* ((content (gptel--trim-prefixes
+                                   (buffer-substring-no-properties (point) prev-pt))))
+               (push (list :role "assistant" :content `[(:text ,content)]) prompts)))
+            (`(tool . ,id)
+             (save-excursion
+               (condition-case nil
+                   (let* ((tool-call (read (current-buffer)))
+                          (name (plist-get tool-call :name))
+                          (args (plist-get tool-call :args)))
+                     (setq id (or id (substring (md5 (format "%s%s" (random) (float-time))) nil 24)))
+                     (plist-put tool-call :id id)
+                     (plist-put tool-call :result
+                                (string-trim (buffer-substring-no-properties
+                                              (point) prev-pt)))
+                     (push (gptel--parse-tool-results backend (list tool-call))
+                           prompts)
+                     (push (list :role "assistant"
+                                 :content `[(:toolUse (:toolUseId ,id
+                                                       :name ,name
+                                                       :input ,args))])
+                           prompts))
+                 ((end-of-file invalid-read-syntax)
+                  (message (format "Could not parse tool-call %s on line %s"
+                                   id (line-number-at-pos (point))))))))
+            ('ignore)
+            ('nil
+             (and max-entries (cl-decf max-entries))
+             (let ((content
+                    (if include-media
+                        (gptel-bedrock--parse-multipart
+                         (gptel--parse-media-links major-mode (point) prev-pt))
+                      (when-let ((text (gptel--trim-prefixes
+                                        (buffer-substring-no-properties (point) prev-pt))))
+                        `[(:text ,text)]))))
+               (when (and content (> (length content) 0))
+                 (push (list :role "user" :content content) prompts)))))
+          (setq prev-pt (point)))
+      (push (list :role "user"
+                  :content `[(:text ,(gptel--trim-prefixes
+                                     (buffer-substring-no-properties (point-min) (point-max))))])
+            prompts))
+    ;; Merge consecutive messages with the same role
+    (let ((merged nil))
+      (dolist (p prompts)
+        (if (and merged (equal (plist-get (car merged) :role) (plist-get p :role)))
+            (let* ((last (car merged))
+                   (new-content (vconcat (plist-get last :content) (plist-get p :content))))
+              (setcar merged (plist-put last :content new-content)))
+          (push p merged)))
+      (nreverse merged))))
 
 (defconst gptel-bedrock--image-formats
   '(("image/jpg" . "jpeg")
